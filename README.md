@@ -47,31 +47,12 @@ Schedule Trigger (polling interval)
 
 State (which papers are pending/in-progress/declined, and the Telegram update offset) is kept in n8n's workflow static data — no external database is required for this workflow.
 
-### 2. `rag-doc-qna-workflow.json` — Document upload + RAG chat
-
-Two independent triggers in one workflow:
-
-**Ingestion pipeline:**
-```
-Form Trigger (file upload: PDF/TXT/DOCX/MD)
-   └─▶ Chroma Vector Store (insert)
-        ▲ fed by: Default Data Loader (PDF loader) ◀── Recursive Character Text Splitter (chunk 400 / overlap 100)
-        ▲ fed by: Embeddings Ollama (nomic-embed-text)
-```
-
-**Chat pipeline:**
-```
-Chat Trigger (chat message received)
-   └─▶ Question and Answer Chain (Retrieval QA, strict "answer only from context" system prompt)
-        ▲ fed by: Ollama Chat Model (llama3.2:1b)
-        ▲ fed by: Vector Store Retriever (topK 15) ◀── Chroma Vector Store ◀── Embeddings Ollama
 ```
 
 ## Technologies used
 
 - [n8n](https://n8n.io) — workflow orchestration (self-hosted)
 - [Ollama](https://ollama.com) — local LLM inference (analysis model + embeddings + chat model)
-- [ChromaDB](https://www.trychroma.com) — self-hosted vector store for the RAG workflow
 - [Telegram Bot API](https://core.telegram.org/bots/api) — notification and interactive yes/no delivery channel
 - arXiv public listing pages (`arxiv.org/list/<category>/new`) — no API key required
 
@@ -80,7 +61,6 @@ Chat Trigger (chat message received)
 ```
 .
 ├── arxiv-research-intelligence-workflow.json   # Daily monitor + interactive analysis workflow
-├── rag-doc-qna-workflow.json                   # Document upload + RAG chat workflow
 ├── .env.example                                 # Placeholder environment variables (reference only)
 ├── .gitignore
 └── README.md
@@ -92,10 +72,9 @@ Chat Trigger (chat message received)
 
 - A running n8n instance (self-hosted; tested against a recent n8n version with the `@n8n/n8n-nodes-langchain` community/built-in nodes available for the RAG workflow).
 - [Ollama](https://ollama.com) running and reachable from your n8n instance, with the following models pulled:
-  - An analysis/chat model (the original used `qwen3:4b` for paper analysis and `llama3.2:1b` for RAG chat — any Ollama chat-capable model works, adjust for your hardware).
+  - An analysis/chat model (the original used `qwen3:4b` for paper analysis - any Ollama chat-capable model works, adjust for your hardware).
   - An embedding model (`nomic-embed-text`).
-- A self-hosted [ChromaDB](https://www.trychroma.com) instance (only required for the RAG workflow).
-- A Telegram bot (only required for the arXiv monitor workflow) and your personal Telegram chat/user ID. To create one: open a chat with [@BotFather](https://t.me/BotFather) on Telegram and send `/newbot`. Follow the prompts to choose a name and a unique username for your bot. BotFather will reply with a bot token (looks like `123456789:ABC-your-token`) — copy this, you'll need it for setup below. Then message [@userinfobot](https://t.me/userinfobot) to get your own numeric chat/user ID, which the workflow uses to know where to send you messages.
+- A Telegram bot and your personal Telegram chat/user ID. To create one: open a chat with [@BotFather](https://t.me/BotFather) on Telegram and send `/newbot`. Follow the prompts to choose a name and a unique username for your bot. BotFather will reply with a bot token (looks like `123456789:ABC-your-token`) — copy this, you'll need it for setup below. Then message [@userinfobot](https://t.me/userinfobot) to get your own numeric chat/user ID, which the workflow uses to know where to send you messages.
 
 ## Credentials required
 
@@ -104,20 +83,11 @@ None of the credentials below are included in this repository. You must create y
 | Credential type | Used by | What you need |
 |---|---|---|
 | Telegram API | `arxiv-research-intelligence-workflow.json` (all Telegram nodes) | A bot token from [@BotFather](https://t.me/BotFather), added as an n8n "Telegram API" credential |
-| Ollama API | Both workflows (LLM/embedding nodes) | The base URL of your running Ollama instance, added as an n8n "Ollama" credential |
-| ChromaDB (self-hosted) | `rag-doc-qna-workflow.json` (vector store nodes) | The URL of your running ChromaDB instance, added as an n8n "ChromaDB Self-Hosted" credential |
+| Ollama API | LLM/embedding nodes | The base URL of your running Ollama instance, added as an n8n "Ollama" credential |
 
-## Configuration required after import
 
-1. **Import both workflow JSON files** into n8n (see below).
-2. **Assign your own credentials** on every node that references `telegramApi`, `ollamaApi`, or `chromaSelfHostedApi` — the credential `id` fields have been stripped, so n8n will show these as unset. Select or create your own credential of the matching type on each node.
-3. **Replace the Telegram chat ID placeholder.** In `arxiv-research-intelligence-workflow.json`, the nodes `GR-QC — Telegram`, `Q-FIN — Telegram`, `GR-QC — Send Brief`, and `Q-FIN — Send Brief` have `chatId` set to `YOUR_TELEGRAM_CHAT_ID`. Replace this with your own numeric Telegram user/chat ID (message [@userinfobot](https://t.me/userinfobot) to find yours).
-4. **Replace the Telegram bot token placeholder.** In the `Get Telegram Updates` node, the URL contains `botYOUR_TELEGRAM_BOT_TOKEN` — n8n's Telegram credential type does not cover raw HTTP Request nodes, so this node authenticates via the token embedded directly in the URL. Replace `YOUR_TELEGRAM_BOT_TOKEN` with your bot's actual token (keep the `bot` prefix, e.g. `.../bot123456:ABC-your-token/getUpdates`), or better, store it in an n8n credential/variable and reference it via an expression instead of hardcoding it.
-5. **Replace the Ollama URL placeholder.** The nodes `GR-QC — Ollama Full-Paper Analysis` and `Q-FIN — Ollama Full-Paper Analysis` call Ollama directly via HTTP Request (`http://YOUR_OLLAMA_URL/api/chat`) rather than through the Ollama credential type. Replace `YOUR_OLLAMA_URL` with your Ollama instance's host and port (for a local Docker-based n8n install talking to Ollama running on the host machine, this is typically `host.docker.internal:11434`; for a native install, `localhost:11434`).
-6. **Review the keyword lists and categories** in the `Build Daily Query` and `Parse + Keyword Gate` code nodes for each domain branch, and adjust the arXiv category codes and keywords to match your research interests.
-7. **Review the schedule trigger times** (`Daily 08:30 IST` and the polling `Schedule Trigger`) and adjust to your timezone/preferences.
-8. **Set the ChromaDB collection name** (`rag_documents` by default, in the Chroma Vector Store nodes) if you want a different collection.
-9. Both workflows are imported with `active: false`. Activate them from the n8n editor once credentials and configuration are verified.
+
+
 
 ## How to import the n8n workflows
 
