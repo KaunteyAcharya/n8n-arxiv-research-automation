@@ -1,5 +1,6 @@
 # ArXiv Research Analysis Agent
 
+https://github.com/user-attachments/assets/8319c0ea-c061-48a9-abe0-bba424253090
 
 An automated n8n workflow that monitors [arXiv](https://arxiv.org) for new papers in chosen categories, filters them by keyword, runs a local-LLM "first-principles" analysis on the full paper text, and delivers the results to Telegram - with an interactive yes/no confirmation step before committing to a full analysis.
 
