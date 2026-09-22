@@ -1,0 +1,889 @@
+{
+  "name": "arxiv research analysis automation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "id": "d39d3f10-8a1f-4e2c-818c-137c15a964a2",
+      "name": "Daily 08:30 IST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1440,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// TEMP DEBUG: wide window test\nconst HOURS_BACK = 24 * 30; // 30 days, to sanity-check the query mechanism\n\nconst end = new Date();\nconst start = new Date(end.getTime() - HOURS_BACK * 60 * 60 * 1000);\n\nfunction arxivUtc(d) {\n  const yyyy = d.getUTCFullYear();\n  const mm = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n  const dd = String(d.getUTCDate()).padStart(2, \"0\");\n  const hh = String(d.getUTCHours()).padStart(2, \"0\");\n  const mi = String(d.getUTCMinutes()).padStart(2, \"0\");\n  return `${yyyy}${mm}${dd}${hh}${mi}`;\n}\n\nconst date_from = arxivUtc(start);\nconst date_to = arxivUtc(end);\n\nconst domain = \"gr-qc\";\nconst label = \"General Relativity and Quantum Cosmology\";\n\nconst query = `cat:${domain} AND submittedDate:[${date_from} TO ${date_to}]`;\n\nreturn [{\n  json: {\n    domain,\n    label,\n    date: date_to.slice(0, 8),\n    date_from,\n    date_to,\n    query\n  }\n}];"
+      },
+      "id": "43717109-8328-41c0-9189-7aaa3c29d12f",
+      "name": "GR-QC — Build Daily Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -752,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://arxiv.org/list/gr-qc/new?skip=0&show=2000",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "91944a13-94a4-42c7-b6ac-6f4dc71b67df",
+      "name": "GR-QC — Query arXiv",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -496,
+        224
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// GR-QC — Parse arXiv \"new\" LISTING PAGE + Keyword Gate (FIXED)\n// ============================================================\n//\n// ROOT CAUSE OF \"zero output every run\":\n// The old version queried export.arxiv.org/api's search index by\n// submittedDate. That index lags the real /list/gr-qc/new page by\n// multiple days (verified live: it did not yet contain today's\n// \"Naked Singularities beyond Spherical Symmetry\" paper, only\n// papers up to ~3 days old). No client-side date window could fix\n// that -- the upstream index itself was stale.\n//\n// FIX: parse the exact HTML page a human checks at\n// https://arxiv.org/list/gr-qc/new -- this is always accurate for\n// \"today\", with zero date-window math needed on our side.\n//\n// Also: keyword matching now tolerates plural/hyphenated forms\n// (\"naked singularities\", \"naked-singularity\"), not only the exact\n// literal phrase \"naked singularity\" -- today's real matching paper\n// used the plural form, which the old exact-substring check missed.\n// ============================================================\n\nconst input = items[0]?.json ?? {};\nlet html = input.data ?? input.body ?? input.response ?? input.html ?? '';\nif (typeof html !== 'string' || html.trim() === '') {\n  return [];\n}\n\nfunction decodeEntities(text) {\n  return String(text || '')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&#x27;/gi, \"'\")\n    .replace(/&#(\\d+);/g, (_, n) => String.fromCharCode(Number(n)))\n    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));\n}\n\nfunction stripTags(text) {\n  return decodeEntities(String(text || ''))\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\n// ------------------------------------------------------------\n// Isolate the \"New submissions\" section only. Cross-lists and\n// Replacements are deliberately excluded -- a paper that only\n// mentions a keyword because an OLDER paper was revised today is\n// not a new paper.\n// ------------------------------------------------------------\n\nfunction extractSection(fullHtml, sectionName) {\n  const re = new RegExp(\n    `<h3>\\\\s*${sectionName}[^<]*</h3>([\\\\s\\\\S]*?)(?:<dl id=['\"]articles['\"]>|$)`,\n    'i'\n  );\n  const m = fullHtml.match(re);\n  return m ? m[1] : '';\n}\n\nconst newSection = extractSection(html, 'New submissions');\nif (!newSection) {\n  return [];\n}\n\n// ------------------------------------------------------------\n// Announcement date, for published/updated fields\n// ------------------------------------------------------------\n\nlet announceIso = new Date().toISOString();\nconst dateHeaderMatch = html.match(/Showing new listings for [^<]*?(\\d{1,2} [A-Za-z]+ \\d{4})/);\nif (dateHeaderMatch) {\n  const parsed = new Date(dateHeaderMatch[1] + ' UTC');\n  if (!isNaN(parsed.getTime())) {\n    announceIso = parsed.toISOString();\n  }\n}\n\n// ------------------------------------------------------------\n// Extract each <dt>...</dt><dd>...</dd> paper entry\n// ------------------------------------------------------------\n\nconst entryRe = /<dt>([\\s\\S]*?)<\\/dt>\\s*<dd>([\\s\\S]*?)<\\/dd>/g;\nconst papers = [];\nlet m;\nwhile ((m = entryRe.exec(newSection)) !== null) {\n  const dt = m[1];\n  const dd = m[2];\n\n  const idMatch = dt.match(/href\\s*=\\s*\"\\/abs\\/([^\"]+)\"/);\n  if (!idMatch) continue;\n  const arxivId = idMatch[1].trim();\n\n  const titleMatch = dd.match(/list-title[^>]*>\\s*<span class=['\"]descriptor['\"]>Title:<\\/span>([\\s\\S]*?)<\\/div>/i);\n  const title = titleMatch ? stripTags(titleMatch[1]) : '';\n  if (!title) continue;\n\n  const authorsMatch = dd.match(/list-authors['\"]>([\\s\\S]*?)<\\/div>/i);\n  let authors = [];\n  if (authorsMatch) {\n    authors = [...authorsMatch[1].matchAll(/<a[^>]*>([^<]*)<\\/a>/g)]\n      .map(a => decodeEntities(a[1]).trim())\n      .filter(Boolean);\n  }\n\n  const abstractMatch = dd.match(/<p class=['\"]mathjax['\"]>([\\s\\S]*?)<\\/p>/i);\n  const abstract = abstractMatch ? stripTags(abstractMatch[1]) : '';\n\n  papers.push({\n    arxiv_id: arxivId,\n    title,\n    abstract,\n    authors,\n    published: announceIso,\n    updated: announceIso,\n    arxiv_url: `https://arxiv.org/abs/${arxivId}`,\n    pdf_url: `https://arxiv.org/pdf/${arxivId}`\n  });\n}\n\n// ------------------------------------------------------------\n// Keyword gate -- tolerant regex variants of the two required\n// phrases, still hard-gated: no match = dropped entirely.\n// ------------------------------------------------------------\n\nconst KEYWORD_PATTERNS = [\n  { label: 'energy extraction', re: /energy\\s+extraction/i },\n  { label: 'naked singularity', re: /naked[\\s-]+singularit(?:y|ies)/i }\n];\n\nconst output = [];\nfor (const p of papers) {\n  const titleMatches = KEYWORD_PATTERNS.filter(k => k.re.test(p.title)).map(k => k.label);\n  const abstractMatches = KEYWORD_PATTERNS.filter(k => k.re.test(p.abstract)).map(k => k.label);\n  const matchedKeywords = [...new Set([...titleMatches, ...abstractMatches])];\n\n  if (matchedKeywords.length === 0) continue;\n\n  output.push({\n    json: {\n      domain: 'gr-qc',\n      arxiv_id: p.arxiv_id,\n      title: p.title,\n      abstract: p.abstract,\n      authors: p.authors,\n      published: p.published,\n      updated: p.updated,\n      arxiv_url: p.arxiv_url,\n      pdf_url: p.pdf_url,\n      matched_keywords: matchedKeywords,\n      title_keyword_matches: titleMatches,\n      abstract_keyword_matches: abstractMatches,\n      keyword_match_count: matchedKeywords.length\n    }\n  });\n}\n\nreturn output;"
+      },
+      "id": "41e8b88e-a1a3-4c5e-b7e0-8dfcbdc8c764",
+      "name": "GR-QC — Parse + Keyword Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$json.pdf_url}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "ffabe4a8-4390-42ee-ad13-998b6dc1ffb7",
+      "name": "GR-QC — Download Full PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        208,
+        1024
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "id": "9b266e1b-91cb-4340-8a66-774fe50343ad",
+      "name": "GR-QC — Extract Full PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        464,
+        1024
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// GR-QC — Build First-Principles Prompt (SPEED-TUNED)\n// ============================================================\n//\n// Previous version sent the ENTIRE extracted PDF text (a 51-page\n// paper, tens of thousands of characters) and asked the model to\n// independently \"rederive from first principles\" across 8 sections.\n// On a local 4B model that is mostly CPU-bound on an 8GB-RAM laptop,\n// that combination of huge input + huge demanded output took many\n// minutes per paper.\n//\n// Fix:\n// 1. Truncate the paper text to a bounded prefix (covers abstract,\n//    intro, and the start of the derivation/methods -- where the\n//    core setup and definitions live for most gr-qc papers).\n// 2. Ask the model to WALK THROUGH the derivation the paper itself\n//    presents (lighter task for a small model, less prone to\n//    hallucinated \"from scratch\" steps) rather than independently\n//    rederive everything.\n// 3. Put a hard word budget in the prompt and fewer sections, so\n//    the model has a much shorter target to generate toward.\n// (num_predict is capped separately on the Ollama HTTP node.)\n// ============================================================\n\nconst meta = $('GR-QC — Lookup Pending Paper').item.json;\nconst rawText = String($json.text ?? $json.data ?? '');\n\nif (!rawText.trim()) {\n  throw new Error('Full PDF text extraction returned empty text.');\n}\n\nconst MAX_CHARS = 7000;\nlet paperText = rawText.trim();\nlet truncatedNote = '';\nif (paperText.length > MAX_CHARS) {\n  paperText = paperText.slice(0, MAX_CHARS);\n  truncatedNote = `\\n\\n[Note: paper text truncated to the first ${MAX_CHARS} characters (abstract, introduction, and start of the derivation) to keep analysis fast. Later sections were not seen.]`;\n}\n\nconst analysis_prompt = `You are a physics research assistant summarizing a gr-qc paper for a technical reader.\n\nPAPER METADATA\nTitle: ${meta.title}\nAuthors: ${meta.authors.join(', ')}\narXiv: ${meta.arxiv_url}\nMatched keywords: ${meta.matched_keywords.join(', ')}\n\nPAPER TEXT (excerpt)\n================\n${paperText}\n================${truncatedNote}\n\nTASK\nWrite a compact technical walkthrough of THIS paper, grounded only in the excerpt above. Do not independently rederive results from scratch -- instead, explain the derivation and reasoning the paper itself lays out, step by step, in plain language, filling in only short/obvious intermediate algebra the paper skips.\n\nIMPORTANT: Output ONLY the four numbered sections below, starting immediately with \"1. Problem & motivation\". Do not show your reasoning, do not add a preamble, do not restate these instructions, and do not write anything before section 1 or after section 4. Number the sections literally as 1, 2, 3, 4 (never repeat \"1.\" for later sections). Keep section 1 to at most 60 words, section 2 to at most 150 words, section 3 to at most 250 words, and section 4 to at most 140 words, so the full answer finishes well inside the 600-word budget and every section is complete.\n\nStructure, using these exact headers, and keep the ENTIRE response under 600 words total:\n1. Problem & motivation (1-2 sentences)\n2. Setup & key definitions (the objects, assumptions, starting equations the paper introduces)\n3. Walkthrough of the derivation/argument as presented (step by step, in the paper's own logical order)\n4. Main result and what it means\n\nRules: use only what is in the excerpt; if the excerpt cuts off mid-argument, say so plainly rather than inventing the rest; use clean LaTeX notation for any equations; be concise, not exhaustive.`;\n\nreturn [{\n  json: {\n    ...meta,\n    full_paper_text: paperText,\n    analysis_prompt\n  }\n}];"
+      },
+      "id": "3f417d9a-ebab-43a4-a99f-83449c5865c0",
+      "name": "GR-QC — Build First-Principles Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        1024
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://YOUR_OLLAMA_HOST/api/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: 'qwen3:4b', messages: [{ role: 'user', content: $json.analysis_prompt }], stream: false, think: false, options: { temperature: 0.2, num_predict: 1600, num_ctx: 8192 } }) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "02cf7d46-1552-414e-bfa6-5900c683148b",
+      "name": "GR-QC — Ollama Full-Paper Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        912,
+        1024
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = $('GR-QC — Lookup Pending Paper').item.json;\nconst rawAnalysis = $json.message?.content ?? $json.response ?? '';\nfunction stripThinking(text) {\nconst closeTag = '</think>';\nconst idx = text.indexOf(closeTag);\nif (idx !== -1) return text.slice(idx + closeTag.length).trim();\nreturn text.replace(/<think>[\\s\\S]*?<\\/think>/gi, '').trim();\n}\nconst analysis = stripThinking(rawAnalysis);\n\nif (!analysis.trim()) {\n  throw new Error('Ollama returned an empty analysis.');\n}\n\nconst safe = (meta.title || 'paper')\n  .replace(/[^a-z0-9]+/gi, '_')\n  .replace(/^_+|_+$/g, '')\n  .slice(0, 90);\n\nconst markdown = `# ${meta.title}\n\n**Authors:** ${meta.authors.join(', ')}\n\n**arXiv:** ${meta.arxiv_url}\n\n**PDF:** ${meta.pdf_url}\n\n**Submitted:** ${meta.published}\n\n**Matched keywords:** ${meta.matched_keywords.join(', ')}\n\n---\n\n${analysis}\n`;\n\nconst binary = await this.helpers.prepareBinaryData(\n  Buffer.from(markdown, 'utf8'),\n  `${safe}_first_principles_analysis.md`,\n  'text/markdown'\n);\n\nreturn [{\n  json: {\n    ...meta,\n    analysis\n  },\n  binary: {\n    analysis_md: binary\n  }\n}];"
+      },
+      "id": "ec1c4100-cceb-435a-beb4-dc087e630cd0",
+      "name": "GR-QC — Create Markdown Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        1024
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "binaryData": true,
+        "binaryPropertyName": "analysis_md",
+        "additionalFields": {
+          "caption": "={{ $json.title }} — First-principles analysis"
+        }
+      },
+      "id": "951f0ed3-9382-4594-a1cc-c225fa8836c4",
+      "name": "GR-QC — Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1408,
+        1024
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "YOUR_CREDENTIAL_NAME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Q-FIN daily arXiv query.\n// At 08:30 IST, retrieve the complete previous IST calendar day's\n// q-fin submissions.\n\nconst now = new Date();\nconst istNow = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);\n\nconst y = istNow.getUTCFullYear();\nconst m = istNow.getUTCMonth();\nconst d = istNow.getUTCDate();\n\nconst day = new Date(Date.UTC(y, m, d - 1));\n\nconst yyyy = day.getUTCFullYear();\nconst mm = String(day.getUTCMonth() + 1).padStart(2, '0');\nconst dd = String(day.getUTCDate()).padStart(2, '0');\n\nconst dateFrom = `${yyyy}${mm}${dd}0000`;\nconst dateTo   = `${yyyy}${mm}${dd}2359`;\n\nreturn [{\n  json: {\n    domain: 'q-fin',\n    label: 'Quantitative Finance',\n    date_from: dateFrom,\n    date_to: dateTo,\n    query: `(cat:q-fin.PM OR cat:q-fin.MF OR cat:q-fin.RM OR cat:q-fin.ST) AND submittedDate:[${dateFrom} TO ${dateTo}]`,\n    keywords: ['portfolio optimization']\n  }\n}];"
+      },
+      "id": "b13989ff-f468-4920-928c-517eacccbe0e",
+      "name": "Q-FIN — Build Daily Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -768,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://arxiv.org/list/q-fin/new?skip=0&show=2000",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "b0fb1539-3c87-4ff4-bffe-6d8a0a011b5f",
+      "name": "Q-FIN — Query arXiv",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -512,
+        560
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Q-FIN — Parse arXiv \"new\" LISTING PAGE + Keyword Gate (FIXED)\n// ============================================================\n//\n// Same root-cause fix as the GR-QC branch: export.arxiv.org/api's\n// search index lags the real /list/q-fin/new page by multiple\n// days, so it silently missed today's actual new submissions.\n// This now parses the same HTML page a human checks at\n// https://arxiv.org/list/q-fin/new -- always accurate for \"today\",\n// no date-window math needed.\n//\n// Keyword matching tolerates plural/spelling variants of\n// \"portfolio optimization\" (optimisation, optimizations), not only\n// the exact literal phrase.\n// ============================================================\n\nconst input = items[0]?.json ?? {};\nlet html = input.data ?? input.body ?? input.response ?? input.html ?? '';\nif (typeof html !== 'string' || html.trim() === '') {\n  return [];\n}\n\nfunction decodeEntities(text) {\n  return String(text || '')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&#x27;/gi, \"'\")\n    .replace(/&#(\\d+);/g, (_, n) => String.fromCharCode(Number(n)))\n    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));\n}\n\nfunction stripTags(text) {\n  return decodeEntities(String(text || ''))\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\n// ------------------------------------------------------------\n// Isolate the \"New submissions\" section only (excludes\n// Cross-lists and Replacements -- a revised older paper is not\n// a new paper).\n// ------------------------------------------------------------\n\nfunction extractSection(fullHtml, sectionName) {\n  const re = new RegExp(\n    `<h3>\\\\s*${sectionName}[^<]*</h3>([\\\\s\\\\S]*?)(?:<dl id=['\"]articles['\"]>|$)`,\n    'i'\n  );\n  const m = fullHtml.match(re);\n  return m ? m[1] : '';\n}\n\nconst newSection = extractSection(html, 'New submissions');\nif (!newSection) {\n  return [];\n}\n\n// ------------------------------------------------------------\n// Announcement date, for published/updated fields\n// ------------------------------------------------------------\n\nlet announceIso = new Date().toISOString();\nconst dateHeaderMatch = html.match(/Showing new listings for [^<]*?(\\d{1,2} [A-Za-z]+ \\d{4})/);\nif (dateHeaderMatch) {\n  const parsed = new Date(dateHeaderMatch[1] + ' UTC');\n  if (!isNaN(parsed.getTime())) {\n    announceIso = parsed.toISOString();\n  }\n}\n\n// ------------------------------------------------------------\n// Extract each <dt>...</dt><dd>...</dd> paper entry\n// ------------------------------------------------------------\n\nconst entryRe = /<dt>([\\s\\S]*?)<\\/dt>\\s*<dd>([\\s\\S]*?)<\\/dd>/g;\nconst papers = [];\nlet m;\nwhile ((m = entryRe.exec(newSection)) !== null) {\n  const dt = m[1];\n  const dd = m[2];\n\n  const idMatch = dt.match(/href\\s*=\\s*\"\\/abs\\/([^\"]+)\"/);\n  if (!idMatch) continue;\n  const arxivId = idMatch[1].trim();\n\n  const titleMatch = dd.match(/list-title[^>]*>\\s*<span class=['\"]descriptor['\"]>Title:<\\/span>([\\s\\S]*?)<\\/div>/i);\n  const title = titleMatch ? stripTags(titleMatch[1]) : '';\n  if (!title) continue;\n\n  const authorsMatch = dd.match(/list-authors['\"]>([\\s\\S]*?)<\\/div>/i);\n  let authors = [];\n  if (authorsMatch) {\n    authors = [...authorsMatch[1].matchAll(/<a[^>]*>([^<]*)<\\/a>/g)]\n      .map(a => decodeEntities(a[1]).trim())\n      .filter(Boolean);\n  }\n\n  const abstractMatch = dd.match(/<p class=['\"]mathjax['\"]>([\\s\\S]*?)<\\/p>/i);\n  const summary = abstractMatch ? stripTags(abstractMatch[1]) : '';\n\n  papers.push({\n    arxivId,\n    title,\n    summary,\n    authors,\n    published: announceIso,\n    updated: announceIso,\n    arxivUrl: `https://arxiv.org/abs/${arxivId}`,\n    pdfUrl: `https://arxiv.org/pdf/${arxivId}`\n  });\n}\n\n// ------------------------------------------------------------\n// Keyword gate -- tolerant of plural/spelling variants of\n// \"portfolio optimization\", still hard-gated: no match = dropped.\n// ------------------------------------------------------------\n\nconst KEYWORD_RE = /portfolio\\s+optimi[sz]ation(?:s)?/i;\n\nconst output = [];\nfor (const p of papers) {\n  const titleMatch = KEYWORD_RE.test(p.title);\n  const abstractMatch = KEYWORD_RE.test(p.summary);\n\n  if (!titleMatch && !abstractMatch) continue;\n\n  const matchedKeywords = [];\n  if (titleMatch) matchedKeywords.push('portfolio optimization (title)');\n  if (abstractMatch) matchedKeywords.push('portfolio optimization (abstract)');\n\n  output.push({\n    json: {\n      domain: 'q-fin',\n      category: 'Quantitative Finance',\n      arxiv_id: p.arxivId,\n      arxiv_url: p.arxivUrl,\n      pdf_url: p.pdfUrl,\n      title: p.title,\n      summary: p.summary,\n      authors: p.authors,\n      published: p.published,\n      updated: p.updated,\n      matched_keywords: matchedKeywords,\n      title_keyword_match: titleMatch,\n      abstract_keyword_match: abstractMatch,\n      keyword_match_count: matchedKeywords.length\n    }\n  });\n}\n\nreturn output;"
+      },
+      "id": "6eb82e12-10c3-417c-9612-297640986126",
+      "name": "Q-FIN — Parse + Keyword Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$json.pdf_url}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "b3ad0e29-9af6-4ab0-8c06-d7b1bc6c1c42",
+      "name": "Q-FIN — Download Full PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        224,
+        1248
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "id": "85c80e6d-dbed-45e1-a42b-84b1b74b7da7",
+      "name": "Q-FIN — Extract Full PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://YOUR_OLLAMA_HOST/api/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: 'qwen3:4b', messages: [{ role: 'user', content: $json.analysis_prompt }], stream: false, think: false, options: { temperature: 0.2, num_predict: 1600, num_ctx: 8192 } }) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "e730cc13-ac15-4d40-a52e-b8b0b5de6b7b",
+      "name": "Q-FIN — Ollama Full-Paper Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        912,
+        1248
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = $('Q-FIN — Lookup Pending Paper').item.json;\nconst rawAnalysis = $json.message?.content ?? $json.response ?? '';\nfunction stripThinking(text) {\nconst closeTag = '</think>';\nconst idx = text.indexOf(closeTag);\nif (idx !== -1) return text.slice(idx + closeTag.length).trim();\nreturn text.replace(/<think>[\\s\\S]*?<\\/think>/gi, '').trim();\n}\nconst analysis = stripThinking(rawAnalysis);\nif (!analysis.trim()) {\nthrow new Error('Ollama returned an empty analysis.');\n}\n\nconst safe = (meta.title || 'paper')\n.replace(/[^a-z0-9]+/gi, '_')\n.replace(/^_+|_+$/g, '')\n.slice(0, 90);\nconst markdown = `# ${meta.title}\n\n**Authors:** ${meta.authors.join(', ')}\n\n**arXiv:** ${meta.arxiv_url}\n\n**PDF:** ${meta.pdf_url}\n\n**Submitted:** ${meta.published}\n\n**Matched keyword:** portfolio optimization\n\n---\n\n${analysis}\n`;\nconst binary = await this.helpers.prepareBinaryData(\nBuffer.from(markdown, 'utf8'),\n`${safe}_first_principles_analysis.md`,\n'text/markdown'\n);\n\nreturn [{\njson: {\n...meta,\nanalysis\n},\nbinary: {\nanalysis_md: binary\n}\n}];"
+      },
+      "id": "e339ad71-4734-4829-bd99-c3ca675234d0",
+      "name": "Q-FIN — Create Markdown Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "binaryData": true,
+        "binaryPropertyName": "analysis_md",
+        "additionalFields": {
+          "caption": "={{$json.title}} — First-principles analysis"
+        }
+      },
+      "id": "71b41124-a595-44c5-b554-4953ec174715",
+      "name": "Q-FIN — Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1408,
+        1248
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "YOUR_CREDENTIAL_NAME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Q-FIN — Build First-Principles Prompt (NEW -- was missing)\n// ============================================================\n//\n// This node did not exist: \"Q-FIN — Ollama Full-Paper Analysis\"\n// referenced $json.analysis_prompt directly from \"Extract Full PDF\n// Text\" output, which never set that field -- the Q-FIN branch\n// would have sent an empty/undefined prompt to Ollama whenever a\n// paper actually matched. This node builds it properly, mirroring\n// the GR-QC branch, speed-tuned the same way: bounded excerpt,\n// \"walk through the paper's own steps\" framing, hard word budget.\n// (num_predict/think are set on the Ollama HTTP node itself.)\n// ============================================================\n\nconst meta = $('Q-FIN — Lookup Pending Paper').item.json;\nconst rawText = String($json.text ?? $json.data ?? '');\n\nif (!rawText.trim()) {\n  throw new Error('Full PDF text extraction returned empty text.');\n}\n\nconst MAX_CHARS = 7000;\nlet paperText = rawText.trim();\nlet truncatedNote = '';\nif (paperText.length > MAX_CHARS) {\n  paperText = paperText.slice(0, MAX_CHARS);\n  truncatedNote = `\\n\\n[Note: paper text truncated to the first ${MAX_CHARS} characters (abstract, introduction, and start of the methodology) to keep analysis fast. Later sections were not seen.]`;\n}\n\nconst analysis_prompt = `You are a quantitative-finance research assistant summarizing a paper for a technical reader.\n\nPAPER METADATA\nTitle: ${meta.title}\nAuthors: ${meta.authors.join(', ')}\narXiv: ${meta.arxiv_url}\nMatched keyword: portfolio optimization\n\nPAPER TEXT (excerpt)\n================\n${paperText}\n================${truncatedNote}\n\nTASK\nWrite a compact technical walkthrough of THIS paper, grounded only in the excerpt above. Do not independently rederive results from scratch -- instead, explain the model, optimization problem, and reasoning the paper itself lays out, step by step, in plain language, filling in only short/obvious intermediate algebra the paper skips.\nIMPORTANT: Output ONLY the four numbered sections below, starting immediately with \"1. Problem & motivation\". Do not show your reasoning, do not add a preamble, do not restate these instructions, and do not write anything before section 1 or after section 4. Number the sections literally as 1, 2, 3, 4 (never repeat \"1.\" for later sections). Keep section 1 to at most 60 words, section 2 to at most 150 words, section 3 to at most 250 words, and section 4 to at most 140 words, so the full answer finishes well inside the 600-word budget and every section is complete.\n\nStructure, using these exact headers, and keep the ENTIRE response under 600 words total:\n1. Problem & motivation (1-2 sentences)\n2. Setup & key definitions (the objects, assumptions, starting equations/optimization problem the paper introduces)\n3. Walkthrough of the derivation/argument as presented (step by step, in the paper's own logical order)\n4. Main result and what it means\n\nRules: use only what is in the excerpt; if the excerpt cuts off mid-argument, say so plainly rather than inventing the rest; use clean LaTeX notation for any equations; be concise, not exhaustive.`;\n\nreturn [{\n  json: {\n    ...meta,\n    full_paper_text: paperText,\n    analysis_prompt\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        1248
+      ],
+      "id": "6426e785-d1e3-4b5d-b83f-67452289916e",
+      "name": "Q-FIN — Build First-Principles Prompt"
+    },
+    {
+      "parameters": {
+        "jsCode": "const CHROMA_TENANT_DB = 'http://YOUR_CHROMADB_HOST/api/v2/tenants/default_tenant/databases/default_database';\nconst COLLECTION_NAME = 'arxiv_pending_papers';\nconst coll = await this.helpers.httpRequest({ method: 'GET', url: CHROMA_TENANT_DB + '/collections/' + COLLECTION_NAME, json: true });\nconst CHROMA_BASE = CHROMA_TENANT_DB + '/collections/' + coll.id;\n\nconst DOMAIN = 'gr-qc';\nconst out = [];\nfor (const item of $input.all()) {\n  const p = item.json;\n  const key = DOMAIN + '|' + p.arxiv_id;\n\n  await this.helpers.httpRequest({\n    method: 'POST',\n    url: CHROMA_BASE + '/upsert',\n    headers: { 'Content-Type': 'application/json' },\n    body: {\n      ids: [key],\n      embeddings: [[0]],\n      documents: [String(p.title || '')],\n      metadatas: [{ domain: DOMAIN, arxiv_id: p.arxiv_id, status: 'pending', meta_json: JSON.stringify(p) }]\n    },\n    json: true\n  });\n\n  const absField = p.abstract ?? p.summary ?? '';\n  let abs = String(absField).trim();\n  const words = abs.split(/\\s+/).filter(Boolean);\n  if (words.length > 400) abs = words.slice(0, 400).join(' ') + '...';\n\n  const kw = Array.isArray(p.matched_keywords) ? p.matched_keywords.join(', ') : (p.matched_keywords || '');\n  const brief = '*' + p.title + '*\\n\\nKeyword match: ' + kw + '\\n\\n' + abs + '\\n\\n' + p.arxiv_url + '\\n\\nTo analyze this paper, reply:\\nyes ' + p.arxiv_id + '\\n\\nTo skip it, reply:\\nno ' + p.arxiv_id;\n\n  out.push({ json: { arxiv_id: p.arxiv_id, domain: DOMAIN, title: p.title, brief_text: brief } });\n}\nreturn out;"
+      },
+      "id": "09bb1781-2827-4950-b952-d7974aa0717e",
+      "name": "GR-QC — Store Pending + Brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.brief_text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "d4a29247-f537-46a0-ac20-e7d95ad42cf1",
+      "name": "GR-QC — Send Brief",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        288,
+        224
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "YOUR_CREDENTIAL_NAME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const CHROMA_TENANT_DB = 'http://YOUR_CHROMADB_HOST/api/v2/tenants/default_tenant/databases/default_database';\nconst COLLECTION_NAME = 'arxiv_pending_papers';\nconst coll = await this.helpers.httpRequest({ method: 'GET', url: CHROMA_TENANT_DB + '/collections/' + COLLECTION_NAME, json: true });\nconst CHROMA_BASE = CHROMA_TENANT_DB + '/collections/' + coll.id;\n\nconst DOMAIN = 'q-fin';\nconst out = [];\nfor (const item of $input.all()) {\n  const p = item.json;\n  const key = DOMAIN + '|' + p.arxiv_id;\n\n  await this.helpers.httpRequest({\n    method: 'POST',\n    url: CHROMA_BASE + '/upsert',\n    headers: { 'Content-Type': 'application/json' },\n    body: {\n      ids: [key],\n      embeddings: [[0]],\n      documents: [String(p.title || '')],\n      metadatas: [{ domain: DOMAIN, arxiv_id: p.arxiv_id, status: 'pending', meta_json: JSON.stringify(p) }]\n    },\n    json: true\n  });\n\n  const absField = p.abstract ?? p.summary ?? '';\n  let abs = String(absField).trim();\n  const words = abs.split(/\\s+/).filter(Boolean);\n  if (words.length > 400) abs = words.slice(0, 400).join(' ') + '...';\n\n  const kw = Array.isArray(p.matched_keywords) ? p.matched_keywords.join(', ') : (p.matched_keywords || '');\n  const brief = '*' + p.title + '*\\n\\nKeyword match: ' + kw + '\\n\\n' + abs + '\\n\\n' + p.arxiv_url + '\\n\\nTo analyze this paper, reply:\\nyes ' + p.arxiv_id + '\\n\\nTo skip it, reply:\\nno ' + p.arxiv_id;\n\n  out.push({ json: { arxiv_id: p.arxiv_id, domain: DOMAIN, title: p.title, brief_text: brief } });\n}\nreturn out;"
+      },
+      "id": "16427b11-3486-4345-92e1-f4907edbd9f3",
+      "name": "Q-FIN — Store Pending + Brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        16,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.brief_text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "f49c3bd1-0274-43d8-97ff-9f775ff4ff66",
+      "name": "Q-FIN — Send Brief",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        288,
+        560
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "YOUR_CREDENTIAL_NAME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const CHROMA_TENANT_DB = 'http://YOUR_CHROMADB_HOST/api/v2/tenants/default_tenant/databases/default_database';\nconst COLLECTION_NAME = 'arxiv_pending_papers';\nconst coll = await this.helpers.httpRequest({ method: 'GET', url: CHROMA_TENANT_DB + '/collections/' + COLLECTION_NAME, json: true });\nconst CHROMA_BASE = CHROMA_TENANT_DB + '/collections/' + coll.id;\n\nasync function chromaGet(body) {\n  return await this.helpers.httpRequest({\n    method: 'POST',\n    url: CHROMA_BASE + '/get',\n    headers: { 'Content-Type': 'application/json' },\n    body,\n    json: true\n  });\n}\n\nasync function chromaUpsert(id, metadata, document) {\n  await this.helpers.httpRequest({\n    method: 'POST',\n    url: CHROMA_BASE + '/upsert',\n    headers: { 'Content-Type': 'application/json' },\n    body: {\n      ids: [id],\n      embeddings: [[0]],\n      documents: [document || ''],\n      metadatas: [metadata]\n    },\n    json: true\n  });\n}\n\nconst OFFSET_KEY = 'system|telegram_offset';\nlet maxUpdateId = 0;\ntry {\n  const offsetRec = await chromaGet.call(this, { ids: [OFFSET_KEY], include: ['metadatas'] });\n  if (offsetRec.metadatas && offsetRec.metadatas[0] && offsetRec.metadatas[0].offset) {\n    maxUpdateId = offsetRec.metadatas[0].offset - 1;\n  }\n} catch (e) {}\n\nconst response = $input.first().json;\nconst updates = response.result || [];\n\nconst out = [];\nconst confirmedOffset = maxUpdateId;\nfor (const upd of updates) {\n  if (upd.update_id <= confirmedOffset) continue;\n  maxUpdateId = upd.update_id;\n\n  const msg = upd.message;\n  if (!msg || !msg.text) continue;\n\n  const text = String(msg.text).trim();\n  const m = text.match(/^(yes|no)\\s+(\\S+)/i);\n  if (!m) continue;\n\n  const action = m[1].toLowerCase();\n  const arxivId = m[2];\n  const chatId = msg.chat.id;\n\n  const lookup = await chromaGet.call(this, { where: { arxiv_id: { '$eq': arxivId } }, include: ['metadatas'] });\n  const found = lookup.ids && lookup.ids.length > 0;\n\n  if (!found) {\n    out.push({ json: { kind: 'reply', chat_id: chatId, text: `No pending paper found for ${arxivId}.` } });\n    continue;\n  }\n\n  const recordId = lookup.ids[0];\n  const md = lookup.metadatas[0];\n  const domain = md.domain;\n  const meta = JSON.parse(md.meta_json || '{}');\n\n  if (md.status !== 'pending') {\n    out.push({ json: { kind: 'reply', chat_id: chatId, text: `Already handled: ${arxivId}.` } });\n    continue;\n  }\n\n  if (action === 'no') {\n    await chromaUpsert.call(this, recordId, Object.assign({}, md, { status: 'declined' }), meta.title || '');\n    out.push({ json: { kind: 'reply', chat_id: chatId, text: `Skipped: ${arxivId}.` } });\n  } else if (action === 'yes') {\n    await chromaUpsert.call(this, recordId, Object.assign({}, md, { status: 'in_progress' }), meta.title || '');\n    out.push({ json: { kind: 'reply', chat_id: chatId, text: `Analyzing ${arxivId} — this will take a few minutes...` } });\n    out.push({ json: { kind: 'analyze', domain, ...meta } });\n  }\n}\n\nif (maxUpdateId > confirmedOffset) {\n  await chromaUpsert.call(this, OFFSET_KEY, { kind: 'offset', offset: maxUpdateId + 1 }, 'telegram offset');\n}\n\nif (out.length === 0) {\n  return [{ json: { kind: 'none' } }];\n}\nreturn out"
+      },
+      "id": "a53db0e7-6aec-4caa-b967-dd24cf896272",
+      "name": "Process Callbacks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -544,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'reply');"
+      },
+      "id": "74dcc2e1-d2e2-406b-8422-4b7b010533a5",
+      "name": "Filter — Toasts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'analyze' && i.json.domain === 'gr-qc');"
+      },
+      "id": "97542a5d-4bd4-4e3e-91fa-cd8a2549e3cf",
+      "name": "GR-QC — Lookup Pending Paper",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        1024
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'analyze' && i.json.domain === 'q-fin');"
+      },
+      "id": "4e132a02-eb12-4484-950b-5d998524251e",
+      "name": "Q-FIN — Lookup Pending Paper",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -1456,
+        832
+      ],
+      "id": "e5b5b647-3dd6-4393-bb5c-303ffcffdece",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {}
+      },
+      "id": "ba9b7b1d-cdb2-43fb-94f5-40f1c3a2fadd",
+      "name": "Send Reply Ack",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        320,
+        832
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "YOUR_CREDENTIAL_NAME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://api.telegram.org/botYOUR_TELEGRAM_BOT_TOKEN/getUpdates",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "offset",
+              "value": "={{ $json.offset || 0 }}"
+            },
+            {
+              "name": "timeout",
+              "value": "0"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -1008,
+        832
+      ],
+      "id": "df759054-6103-4897-aa30-5aa8014a7da2",
+      "name": "Get Telegram Updates"
+    },
+    {
+      "parameters": {
+        "jsCode": "const CHROMA_TENANT_DB = 'http://YOUR_CHROMADB_HOST/api/v2/tenants/default_tenant/databases/default_database';\nconst COLLECTION_NAME = 'arxiv_pending_papers';\nconst OFFSET_KEY = 'system|telegram_offset';\n\nlet offset = 0;\ntry {\n  const coll = await this.helpers.httpRequest({ method: 'GET', url: CHROMA_TENANT_DB + '/collections/' + COLLECTION_NAME, json: true });\n  const CHROMA_BASE = CHROMA_TENANT_DB + '/collections/' + coll.id;\n  const rec = await this.helpers.httpRequest({\n    method: 'POST',\n    url: CHROMA_BASE + '/get',\n    headers: { 'Content-Type': 'application/json' },\n    body: { ids: [OFFSET_KEY], include: ['metadatas'] },\n    json: true\n  });\n  if (rec.metadatas && rec.metadatas[0] && rec.metadatas[0].offset) {\n    offset = rec.metadatas[0].offset;\n  }\n} catch (e) {}\n\nreturn [{ json: { offset } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1232,
+        832
+      ],
+      "id": "279fb464-38b1-4d95-b334-3d8cbe1dcb7a",
+      "name": "Get Telegram Offset"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Daily 08:30 IST": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Build Daily Query",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Q-FIN — Build Daily Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Build Daily Query": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Query arXiv",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Query arXiv": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Parse + Keyword Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Parse + Keyword Gate": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Store Pending + Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Download Full PDF": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Extract Full PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Extract Full PDF Text": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Build First-Principles Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Build First-Principles Prompt": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Ollama Full-Paper Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Ollama Full-Paper Analysis": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Create Markdown Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Create Markdown Report": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Build Daily Query": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Query arXiv",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Query arXiv": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Parse + Keyword Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Parse + Keyword Gate": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Store Pending + Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Download Full PDF": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Extract Full PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Extract Full PDF Text": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Build First-Principles Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Ollama Full-Paper Analysis": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Create Markdown Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Create Markdown Report": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Build First-Principles Prompt": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Ollama Full-Paper Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Store Pending + Brief": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Send Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Store Pending + Brief": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Send Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Callbacks": {
+      "main": [
+        [
+          {
+            "node": "Filter — Toasts",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "GR-QC — Lookup Pending Paper",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Q-FIN — Lookup Pending Paper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter — Toasts": {
+      "main": [
+        [
+          {
+            "node": "Send Reply Ack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GR-QC — Lookup Pending Paper": {
+      "main": [
+        [
+          {
+            "node": "GR-QC — Download Full PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q-FIN — Lookup Pending Paper": {
+      "main": [
+        [
+          {
+            "node": "Q-FIN — Download Full PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Telegram Offset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Telegram Updates": {
+      "main": [
+        [
+          {
+            "node": "Process Callbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Telegram Offset": {
+      "main": [
+        [
+          {
+            "node": "Get Telegram Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "id": "YOUR_WORKFLOW_ID",
+  "tags": []
+}
