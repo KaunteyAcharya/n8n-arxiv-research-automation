@@ -1,9 +1,7 @@
 # ArXiv Research Analysis Agent
 
 
-
-
-An automated n8n workflow that monitors [arXiv](https://arxiv.org) for new papers in chosen categories, filters them by keyword, runs a local-LLM "first-principles" analysis on the full paper text, and delivers the results to Telegram — with an interactive yes/no confirmation step before committing to a full analysis.
+An automated n8n workflow that monitors [arXiv](https://arxiv.org) for new papers in chosen categories, filters them by keyword, runs a local-LLM "first-principles" analysis on the full paper text, and delivers the results to Telegram - with an interactive yes/no confirmation step before committing to a full analysis.
 
 ## What this solves
 
@@ -56,11 +54,11 @@ The ChromaDB collection (`arxiv_pending_papers`) stores:
 
 ## Technologies used
 
-- [n8n](https://n8n.io) — workflow orchestration (self-hosted)
-- [Ollama](https://ollama.com) — local LLM inference for the first-principles paper analysis
-- [ChromaDB](https://www.trychroma.com/) — lightweight state persistence for paper status and Telegram offset tracking
-- [Telegram Bot API](https://core.telegram.org/bots/api) — notification and interactive yes/no delivery channel
-- arXiv public listing pages (`arxiv.org/list/<category>/new`) — no API key required
+- [n8n](https://n8n.io) - workflow orchestration (self-hosted)
+- [Ollama](https://ollama.com) - local LLM inference for the first-principles paper analysis
+- [ChromaDB](https://www.trychroma.com/) - lightweight state persistence for paper status and Telegram offset tracking
+- [Telegram Bot API](https://core.telegram.org/bots/api) - notification and interactive yes/no delivery channel
+- arXiv public listing pages (`arxiv.org/list/<category>/new`) - no API key required
 
 ## Project structure
 
@@ -72,12 +70,12 @@ The ChromaDB collection (`arxiv_pending_papers`) stores:
 └── README.md
 ```
 
-> Note: n8n workflows configure most values (URLs, model names, credentials) inside the node parameters and n8n's credential store, not via `.env` files. The `.env.example` in this repo is a reference for the values you'll need to have on hand when configuring nodes and credentials manually in the n8n editor — it is not consumed automatically by n8n.
+> Note: n8n workflows configure most values (URLs, model names, credentials) inside the node parameters and n8n's credential store, not via `.env` files. The `.env.example` in this repo is a reference for the values you'll need to have on hand when configuring nodes and credentials manually in the n8n editor - it is not consumed automatically by n8n.
 
 ## Setup requirements
 
 - A running **n8n** instance (self-hosted).
-- **[Ollama](https://ollama.com)** running and reachable from your n8n instance, with a chat model pulled (the workflow uses `qwen3:4b` — any Ollama chat-capable model works, adjust for your hardware).
+- **[Ollama](https://ollama.com)** running and reachable from your n8n instance, with a chat model pulled (the workflow uses `qwen3:4b` - any Ollama chat-capable model works, adjust for your hardware).
 - **[ChromaDB](https://www.trychroma.com/)** running and reachable from your n8n instance. The simplest setup is a Docker container:
   ```bash
   docker run -d --name chroma -p 8000:8000 chromadb/chroma
@@ -96,7 +94,7 @@ None of the credentials below are included in this repository. You must create y
 ## Configuration required after import
 
 1. **Import the workflow JSON file** into n8n (see below).
-2. **Assign your own Telegram credentials** on every Telegram node — the credential `id` fields have been stripped, so n8n will show these as unset. Select or create your own Telegram API credential on each node.
+2. **Assign your own Telegram credentials** on every Telegram node - the credential `id` fields have been stripped, so n8n will show these as unset. Select or create your own Telegram API credential on each node.
 3. **Replace the Telegram chat ID placeholder.** The nodes `GR-QC — Send Brief`, `Q-FIN — Send Brief`, `GR-QC — Telegram`, and `Q-FIN — Telegram` have `chatId` set to `YOUR_TELEGRAM_CHAT_ID`. Replace this with your own numeric Telegram user/chat ID.
 4. **Replace the Telegram Bot Token placeholder.** In the `Get Telegram Updates` node, the URL contains `YOUR_TELEGRAM_BOT_TOKEN` — replace it with your actual bot token (keep the `bot` prefix in the URL format: `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`).
 5. **Replace the Ollama URL placeholder.** The nodes `GR-QC — Ollama Full-Paper Analysis` and `Q-FIN — Ollama Full-Paper Analysis` call Ollama via HTTP at `http://YOUR_OLLAMA_HOST/api/chat`. Replace `YOUR_OLLAMA_HOST` with your Ollama instance's host and port (typically `host.docker.internal:11434` for Docker-based n8n, or `localhost:11434` for a native install).
@@ -114,12 +112,12 @@ None of the credentials below are included in this repository. You must create y
 ## How to run the automation
 
 - Once activated, the `Daily 08:30 IST`-equivalent trigger runs automatically each day; the second `Schedule Trigger` polls Telegram for your `yes`/`no` replies every minute. No manual execution is needed once configured.
-- The workflow can also be run manually from the n8n editor ("Execute workflow") for testing — each manual run will re-check arXiv listings, store any keyword-matched papers as pending, and send the brief to Telegram.
+- The workflow can also be run manually from the n8n editor ("Execute workflow") for testing - each manual run will re-check arXiv listings, store any keyword-matched papers as pending, and send the brief to Telegram.
 
 ## Security considerations
 
-- **Never commit real credentials.** This repository's workflow JSON file contains no API keys, bot tokens, or credential IDs — all such values were replaced with placeholders (`YOUR_TELEGRAM_BOT_TOKEN`, `YOUR_TELEGRAM_CHAT_ID`, `YOUR_OLLAMA_HOST`, `YOUR_CHROMADB_HOST`) or stripped entirely. You must supply your own via n8n's credential store or by editing the placeholder values directly.
-- **Telegram API Key in a URL.** Because the `Get Telegram Updates` node uses a raw HTTP Request rather than the Telegram credential type, your Telegram API Key lives in the node's URL field once configured. Treat your n8n workflow exports and instance backups as sensitive once you've filled in a real key — do not re-export and share this workflow publicly after configuring it with real values.
+- **Never commit real credentials.** This repository's workflow JSON file contains no API keys, bot tokens, or credential IDs - all such values were replaced with placeholders (`YOUR_TELEGRAM_BOT_TOKEN`, `YOUR_TELEGRAM_CHAT_ID`, `YOUR_OLLAMA_HOST`, `YOUR_CHROMADB_HOST`) or stripped entirely. You must supply your own via n8n's credential store or by editing the placeholder values directly.
+- **Telegram API Key in a URL.** Because the `Get Telegram Updates` node uses a raw HTTP Request rather than the Telegram credential type, your Telegram API Key lives in the node's URL field once configured. Treat your n8n workflow exports and instance backups as sensitive once you've filled in a real key - do not re-export and share this workflow publicly after configuring it with real values.
 - **Local-only LLM inference.** This workflow is designed around a self-hosted Ollama instance, so paper content is not sent to a third-party LLM API by default. If you adapt this to use a cloud LLM provider, review what data you are sending externally.
 - **ChromaDB access.** The workflow connects to ChromaDB without authentication by default. If your ChromaDB instance is network-accessible, consider adding authentication or restricting access to localhost.
 - **This workflow was exported with `active: false`.** Review all node configuration and credentials before activating it against your own Telegram bot and Ollama instance.
